@@ -1,0 +1,233 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: servo-config
+  labels:
+      app.kubernetes.io/name: servo
+      app.kubernetes.io/component: core
+data:
+  optimizer: {{OPSANI_ACCOUNT_NAME}}/{{OPSANI_APPLICATION_NAME}}
+  log_level: INFO
+  servo.yaml: |
+    connectors:
+    - kubernetes
+    - prometheus
+    kubernetes:
+      on_failure: rollback
+      namespace: {{ NAMESPACE }}
+      deployments:
+      - name: {{ DEPLOYMENT }}
+        strategy:
+          type: canary
+          alias: tuning
+        containers:
+        - name: {{ CONTAINER }}
+          alias: main
+          cpu:
+            min: 250m
+            max: 2000m
+            step: 125m
+          memory:
+            min: 384Mi
+            max: 3Gi
+            step: 128Mi
+        replicas:
+          min: 0
+          max: 1
+          pinned: true
+          step: 1
+          default: 1
+          value: 1
+        timeout: 5m
+      description: bofa frontend
+    prometheus:
+      # NOTE: In a sidecar configuration, Prometheus is colocated with the servo in the Pod
+      base_url: http://prometheus-server.ingress.svc:9090
+      metrics:
+        - name: main_instance_count
+          query: sum(nginx_ingress_nginxplus_upstream_server_state{pod_name!~".*tuning"})
+          unit: rpm
+        - name: tuning_instance_count
+          query: sum(nginx_ingress_nginxplus_upstream_server_state{pod_name=~".*tuning"})
+          unit: rpm
+        - name: main_pod_avg_request_rate
+          query: avg(rate(nginx_ingress_nginxplus_upstream_server_requests{pod_name!~".*tuning"}[3m])) OR on() vector(0)
+          unit: rps
+        - name: total_request_rate
+          query: sum(rate(nginx_ingress_nginxplus_upstream_server_requests[3m])) OR on() vector(0)
+          unit: rps
+        - name: main_request_rate
+          query: sum(rate(nginx_ingress_nginxplus_upstream_server_requests{pod_name!~".*tuning"}[3m])) OR on() vector(0)
+          unit: rps
+        - name: tuning_request_rate
+          query: rate(nginx_ingress_nginxplus_upstream_server_requests{pod_name=~".*tuning"}[3m]) OR on() vector(0)
+          unit: rps
+        - name: main_success_rate
+          query: sum(rate(nginx_ingress_nginxplus_upstream_server_responses{pod_name!~".*tuning", code=~"2xx|3xx"}[3m])) OR on() vector(0)
+          unit: rps
+        - name: tuning_success_rate
+          query: rate(nginx_ingress_nginxplus_upstream_server_responses{pod_name=~".*tuning", code=~"2xx|3xx"}[3m]) OR on() vector(0)
+          unit: rps
+        - name: main_error_rate
+          query: sum(rate(nginx_ingress_nginxplus_upstream_server_responses{pod_name!~".*tuning", code=~"4xx|5xx"}[3m])) OR on() vector(0)
+          unit: rps
+        - name: tuning_error_rate
+          query: rate(nginx_ingress_nginxplus_upstream_server_responses{pod_name=~".*tuning", code=~"4xx|5xx"}[3m]) OR on() vector(0)
+          unit: rps
+        - name: main_latency
+          query: avg(irate(nginx_ingress_nginxplus_upstream_server_response_time{pod_name!~".*tuning"}[3m])) OR on() vector(0)
+          unit: ms
+        - name: tuning_latency
+          query: avg(irate(nginx_ingress_nginxplus_upstream_server_response_time{pod_name=~".*tuning"}[3m])) OR on() vector(0)
+          unit: ms
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: servo
+  labels:
+    app.kubernetes.io/name: servo
+    app.kubernetes.io/component: core
+spec:
+  replicas: 1
+  revisionHistoryLimit: 2
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: servo
+  template:
+    metadata:
+      name: servo
+      labels:
+        app.kubernetes.io/name: servo
+        app.kubernetes.io/component: core
+    spec:
+      serviceAccountName: servo
+      containers:
+      - name: servo
+        image: opsani/servox:latest
+        terminationMessagePolicy: FallbackToLogsOnError
+        args:
+          - 'run'
+        env:
+        - name: OPSANI_OPTIMIZER
+          valueFrom:
+            configMapKeyRef:
+              name: servo-config
+              key: optimizer
+        - name: OPSANI_TOKEN_FILE
+          value: /servo/opsani.token
+        - name: SERVO_LOG_LEVEL
+          valueFrom:
+            configMapKeyRef:
+              name: servo-config
+              key: log_level
+        - name: POD_NAME
+          valueFrom:
+              fieldRef:
+                fieldPath: metadata.name
+        - name: POD_NAMESPACE
+          valueFrom:
+              fieldRef:
+                fieldPath: metadata.namespace
+        volumeMounts:
+        - name: servo-token-volume
+          mountPath: /servo/opsani.token
+          subPath: opsani.token
+          readOnly: true
+        - name: servo-config-volume
+          mountPath: /servo/servo.yaml
+          subPath: servo.yaml
+          readOnly: true
+        resources:
+          limits:
+            cpu: 500m
+            memory: 1Gi
+
+      volumes:
+      - name: servo-token-volume
+        secret:
+          secretName: servo-token
+          items:
+          - key: token
+            path: opsani.token
+      - name: servo-config-volume
+        configMap:
+          name: servo-config
+          items:
+          - key: servo.yaml
+            path: servo.yaml
+
+      # Prefer deployment onto a Node labeled role=servo
+      # This ensures physical isolation and network transport if possible
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 1
+            preference:
+              matchExpressions:
+              - key: node.opsani.com/role
+                operator: In
+                values:
+                - servo
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: servo-token
+  labels:
+    app.kubernetes.io/name: servo
+    app.kubernetes.io/component: core
+type: Opaque
+stringData:
+  token: {{ OPSANI_APPLICATION_TOKEN }}
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: servo
+  labels:
+    app.kubernetes.io/name: servo
+    app.kubernetes.io/component: core
+
+---
+# Cluster Role for the servo itself
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: servo
+  labels:
+    app.kubernetes.io/name: servo
+    app.kubernetes.io/component: core
+rules:
+- apiGroups: ["apps"]
+  resources: ["deployments", "deployments/status", "replicasets"]
+  verbs: ["get", "list", "watch", "update", "patch"]
+- apiGroups: [""]
+  resources: ["pods", "pods/logs", "pods/status", "pods/exec", "pods/portforward", "services"]
+  verbs: ["create", "delete", "get", "list", "watch", "update", "patch" ]
+- apiGroups: [""]
+  resources: ["namespaces"]
+  verbs: ["get", "list"]
+
+---
+# Bind the Servo Cluster Role to the servo Service Account
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: servo
+  labels:
+    app.kubernetes.io/name: servo
+    app.kubernetes.io/component: core
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: servo
+subjects:
+- kind: ServiceAccount
+  name: servo
+  namespace: {{ NAMESPACE }}
